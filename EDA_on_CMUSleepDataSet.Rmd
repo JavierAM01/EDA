@@ -1,0 +1,490 @@
+
+
+```yaml
+---
+title: "Exploratory Data Analysis on CMU Sleep Dataset"
+author: "Francisco Javier Abollado"
+date: "`r Sys.Date()`"
+output: html_document
+---
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# 0. Introduction
+
+In this analysis, we perform an exploratory data analysis (EDA) on the CMU Sleep dataset. The purpose is to examine key variables, handle missing data, and investigate relationships between sleep patterns and GPA across different cohorts and universities. The analysis will be presented with a combination of summary statistics, visualizations, and correlation studies.
+
+# 1. Load Data
+
+```{r}
+# Load necessary libraries
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+
+
+df <- read.csv('cmu-sleep.csv')
+```
+
+# 2. Initial Data Inspection
+
+We begin by inspecting the structure and summary statistics of the dataset to understand its contents and identify potential issues with the data.
+
+```{r}
+# View basic information about the dataset
+str(df)
+head(df)
+summary(df)
+```
+
+# 3. Data Preprocessing
+
+## 3.1 Correct Data Types
+
+We will inspect the values in the columns and convert the appropriate ones to factor types. Initially, it's clear that 'cohort' should be treated as a factor. Additionally, after reviewing the unique values in the 'demo_race', 'demo_gender', 'study', and 'demo_firstgen' columns, we observe that they contain [0,1] or [0,1,2] values, which can be mapped to categories such as (True, False) or (No, Yes, More than one).
+
+```{r}
+# Convert relevant columns to factor type
+df$cohort <- factor(df$cohort)
+df$study <- factor(df$study)
+df$demo_race <- factor(df$demo_race)
+df$demo_gender <- factor(df$demo_gender)
+df$demo_firstgen <- factor(df$demo_firstgen)
+
+# Store factor columns for reference
+factor_names = c("cohort", "study", "demo_race", "demo_gender", "demo_firstgen")
+```
+
+
+
+
+## 3.2 Add Study-Specific Information
+
+We will enrich the dataset by adding additional information about the study, including the university and semester.
+
+```{r}
+# Create a mapping dataframe for study details
+df_mapping <- data.frame(
+    study = factor(1:5), 
+    university = factor(c("Carnegie Mellon", "Washington", "Washington", "Notre Dame", "Carnegie Mellon")),
+    semester = factor(c("Spring 2018", "Spring 2018", "Spring 2019", "Spring 2016", "Spring 2017"))
+)
+
+# Join the mapping information to the main dataset
+df <- df %>% left_join(df_mapping, by="study")
+```
+
+# 4. Handling Missing Data
+
+We first check for missing values across all columns and identify columns with significant amounts of missing data.
+
+```{r}
+# Check for missing values in the dataset
+colSums(is.na(df))
+```
+
+## 4.1 Strategy for Missing Data
+
+As we can observe, nearly all the NaN values (except for 8) are found in the `term_units` and `Zterm_units_ZofZ` columns. Additionally, there are exactly 147 missing values in each column, which suggests that 147 rows may have NaN values in both features. This would imply that the number of affected rows is actually half of what we initially expected. To confirm this, I'll check how many NaN values are present in `Zterm_units_ZofZ` when`term_units` is also missing.
+
+We will create two versions of the dataset:
+
+ - `df.main`: A version excluding these two columns and with no missing values.
+ - `df.clean`: A version with all columns but no missing values.
+
+```{r}
+# Create two versions of the dataset
+df.main <- df %>% select(-term_units, -Zterm_units_ZofZ) %>% drop_na()
+df.clean <- df %>% drop_na()
+```
+
+# 5. Outliers
+
+No that we have all the numeric values without any Nan values, we are going to check any possible outliers around the dataset. For that we are going to create a function that substruct all the values that are `n` variance far from the mean.
+
+```{r}
+numeric_cols <- names(df.main)[sapply(df.main, is.numeric)]
+df.numeric <- df.main[, numeric_cols]
+
+extract_outliers <- function (df, n, returndf=TRUE, print=FALSE){
+
+  # Assuming 'df' is your dataframe
+  # Calculate Z-scores
+  z_scores <- as.data.frame(scale(df))
+  
+  # Detect outliers (absolute z-scores > 3)
+  outliers <- abs(z_scores) > n
+  
+  # Remove rows where any column has an outlier
+  df_no_outliers <- df[!rowSums(outliers), ]
+  
+  # Print the shape (dimensions) of the data before and after removing outliers
+  cat("\nFor n = ", n, ":\n")
+  cat("Data shape before removing outliers:", dim(df), "\n")
+  cat("Data shape after removing outliers:", dim(df_no_outliers), "\n")
+  
+  if (returndf){
+    return(df_no_outliers)
+  }
+}
+
+extract_outliers(df.numeric, 3, returndf=FALSE, print=TRUE)
+extract_outliers(df.numeric, 5, returndf=FALSE, print=TRUE)
+extract_outliers(df.numeric, 8, returndf=FALSE, print=TRUE)
+```
+
+
+As we can see, with `n = 8`, very few outliers are removed, making the criterion too strict. Conversely, with `n = 3`, we remove too many data points, which seems excessive and could result in the loss of valuable information. Therefore, I will choose an intermediate value of `n = 5` for this case. This strikes a balance by removing some outliers without discarding too much data that might be important for the analysis.
+
+
+```{r}
+df.numeric <- extract_outliers(df.numeric, 5)
+```
+
+Also for this we assumed that the data is moving in normal distribution in order to find outliers. We are going to have a brief look at their real distributions:
+
+
+```{r}
+df.numeric %>%
+  pivot_longer(cols = everything(), names_to = "key", values_to = "value") %>%
+  ggplot(., aes(x = value)) +
+    geom_histogram(bins = 30, fill = "purple", color = "white") +
+    facet_wrap(~key, scales = "free") +
+    theme_minimal() +
+    labs(title = "Histograms of All Numeric Columns", x = "Value", y = "Frequency")
+```
+
+
+## 5.1 Observations:
+
+We observe that not all the data is normal distributed, therefore that previous simple approach that we did before is not really a good solution to select the outliers. We are going to study a bit deeper each column and after it select an option to work with these outliers.
+
+1. **`TotalSleepTime`**: 
+   - This appears to have a **normal distribution** (bell-shaped curve), although slightly skewed to the left.
+   - For normally distributed data, using the **Z-score** method for outlier detection might work well, as it assumes a normal distribution.
+
+2. **`cum_gpa` and `term_gpa`**:
+   - These distributions are both **left-skewed**, concentrated around 3.0–4.0.
+   - Since GPA values are often constrained by their range (1 to 4), using **IQR (Interquartile Range)** to detect outliers might be more appropriate here, as Z-scores may not accurately reflect outliers in a bounded distribution.
+
+3. **`subject_id`**:
+   - As you correctly pointed out, `subject_id` does not hold any meaningful numerical value. This column should be excluded from outlier detection and any statistical analysis, as it's merely an identifier.
+
+4. **`midpoint_sleep`** and **`daytime_sleep`**:
+   - Both distributions look **approximately normal** but may be slightly skewed. Similar to `TotalSleepTime`, **Z-score** could work for detecting outliers here.
+
+5. **`bedtime_mssd`**:
+   - This distribution is heavily **right-skewed**, with many low values and a long tail of higher values.
+   - For heavily skewed data like this, the **IQR method** would be more appropriate, as it doesn’t assume normality and is more robust to skewness.
+
+6. **`frac_nights_with_data`**:
+   - This has a **binary-like** distribution, with values concentrated near 0 and 1. Outlier detection may not be necessary here, as this column seems to represent either presence or absence of data in each night.
+
+## 5.2 Suggested Outlier Detection Methods:
+
+- **Z-score method** (for normal or nearly normal distributions):  
+   Use this for columns like `TotalSleepTime`, `midpoint_sleep`, and potentially `daytime_sleep`.
+  
+- **IQR method** (for skewed distributions or bounded data):  
+   Use this for columns like `cum_gpa`, `term_gpa`, `bedtime_mssd`, and `frac_nights_with_data`. The IQR method is more robust to skewness and doesn’t rely on the assumption of normality.
+
+## 5.3 Algorithm
+
+We need to ensure that the rows remain aligned correctly by using the common row indices to merge the data back together, preserving only the rows that are present in all cleaned parts.
+
+To handle this correctly, we will:
+
+ - Use a common unique identifier to keep track of the rows, for that we will create a new column names `index` as `subject_id` is not unique.
+ - Perform inner joins on the cleaned datasets to ensure that only the rows present in all parts are retained.
+
+
+```{r}
+df.numeric$index <- 1:dim(df.numeric)[1]
+
+# Function to remove outliers using Z-score method
+remove_outliers_zscore <- function(df, threshold = 5) {
+  z_scores <- scale(df)  # Compute Z-scores
+  df_clean <- df[!rowSums(abs(z_scores) > threshold), ]  # Remove rows where Z-score is above the threshold
+  return(df_clean)
+}
+
+# Function to remove outliers using IQR method
+remove_outliers_iqr <- function(df, tail="right") {
+  Q1 <- apply(df, 2, quantile, 0.2, na.rm = TRUE)  # First quartile (25th percentile)
+  Q3 <- apply(df, 2, quantile, 0.8, na.rm = TRUE)  # Third quartile (75th percentile)
+  IQR <- Q3 - Q1  # Interquartile range
+
+  # Define lower and upper bounds for outlier detection
+  if (tail == "right"){
+    lower_bound <- min(df)
+    upper_bound <- Q3 + 5 * IQR
+  } 
+  else {
+    lower_bound <- Q1 - 5 * IQR
+    upper_bound <- max(df)
+  }
+
+  # Remove rows with outliers based on IQR
+  df_clean <- df[!rowSums(df < lower_bound | df > upper_bound), ]
+  return(df_clean)
+}
+
+# Create lists of columns that need each method
+columns_zscore <- c("TotalSleepTime", "midpoint_sleep", "daytime_sleep")
+columns_iqr_lefttail <- c("cum_gpa", "term_gpa")
+columns_iqr_righttail <- c("bedtime_mssd")
+
+# Apply Z-score method to specific columns
+df_zscore <- df.numeric %>%
+  select(index, all_of(columns_zscore)) %>%  # Include the unique identifier
+  remove_outliers_zscore()
+
+# Apply IQR method to specific columns
+df_iqr_left <- df.numeric %>%
+  select(index, all_of(columns_iqr_lefttail)) %>%
+  remove_outliers_iqr(., tail="left")
+df_iqr_right <- df.numeric %>%
+  select(index, all_of(columns_iqr_righttail)) %>%
+  remove_outliers_iqr(., tail="right")
+
+# Keep the other columns that do not need outlier detection
+columns_no_outliers <- setdiff(names(df.numeric), c(columns_zscore, columns_iqr_lefttail, columns_iqr_righttail))
+df_no_outliers <- df.numeric %>%
+  select(all_of(columns_no_outliers))
+
+# Perform inner join on subject_id to ensure only rows present in all parts are retained
+df.numeric.clean <- df_no_outliers %>%
+  inner_join(df_zscore, by = "index") %>%
+  inner_join(df_iqr_left, by = "index") %>%
+  inner_join(df_iqr_right, by = "index")
+
+# Final result: cleaned dataframe with outliers removed
+print("Data after outlier removal:")
+cat("\n - zscores: ", dim(df_zscore))
+cat("\n - iqr-left: ", dim(df_iqr_left))
+cat("\n - iqr-right: ", dim(df_iqr_right))
+cat("\n - clean: ", dim(df.numeric.clean))
+
+``` 
+
+We can play with this numbers. The Z-scores as 5 looks reasonable and doesn't get rid of many values. Also the irq-left works fine, while the iqr-right drop too many columns. That's because of the `bedtime_mssd` values, that are extremely skew. We can solve this by increasing the value or leave it like that depending on the strictness of the analyst, but for now we are going to continue with EDA.
+
+
+
+# 6. Exploratory Data Analysis (EDA)
+
+Prior to any analysis, we are going to do a simple scatter-plot visualization the data related with the term GPA as our target value.
+
+```{r}
+library(tidyr)
+target_var <- "term_gpa"
+df_long <- pivot_longer(df.numeric ,cols = c(-target_var, -subject_id, -index), names_to = "variable", values_to = "value") %>% select(-subject_id, -index)
+ggplot(df_long, aes(x = value, y = .data[[target_var]])) +
+    geom_point(color="purple", alpha=0.6) +
+    facet_wrap(~ variable, scales = "free") +
+    labs(x = "Value", y = target_var, title = "Scatter plots of all variables vs Target") +
+    theme_minimal()
+```
+
+we can observed some concentrations of data but not relationship with the target value (except obviously `cum_gpa`). I'll just point out that in columns [`bedtime_mssd`, `daytime_sleep`, `TotalSleep Time`] the outliers pointing to more time of sleep they all have between 3-4 GPA. Meaning in a good outcome after a good sleep, something that we can't say with `midpoint_sleep` as the representation is different. 
+
+
+## 6.1 How are GPA scores distributed across the students?
+
+We are going to have a brief look at the GPA distributions along Studies and Gender. We'll find out that basically there is no big difference between different studies and gender, as they all have a big pick at GPA > 3.
+
+### 6.1.1 GPA Distribution Across Studies
+
+We begin by examining the distribution of `term_gpa` across different studies.
+
+```{r}
+# Histogram of Term GPA per study
+ggplot(df.main, aes(x = term_gpa)) + 
+  geom_histogram(bins = 12, fill = "lightblue", color = "white") + 
+  labs(x = "Term GPA", y = "Frequency", title = "Term GPA per Study") +
+  xlim(1, 4) + 
+  facet_wrap(~study, scales = 'free') + 
+  theme_minimal()
+```
+
+### 6.1.2 GPA Distribution Across Genders
+
+Next, we explore the distribution of GPA between male and female students.
+
+```{r}
+# Histogram of Term GPA per gender
+ggplot(df.main, aes(x = term_gpa)) + 
+  geom_histogram(bins = 12, fill = "lightblue", color = "white") + 
+  labs(x = "Term GPA", y = "Frequency", title = "Term GPA per Gender") +
+  xlim(1, 4) + 
+  facet_wrap(~demo_gender, scales = 'free', labeller = as_labeller(c("0" = "Male", "1" = "Female"))) + 
+  theme_minimal()
+```
+
+
+## 6.2 Analyzing the Relationship Between Sleep Patterns and Academic Performance by sections
+
+In this analysis, we are investigating how students' sleep patterns, measured in midpoint sleep sections, are distributed across different GPA ranges. To ensure that the overall distribution of sleep times doesn't affect the results, we first normalize the data by calculating the percentage of students in each GPA section within each sleep category. Then, we further normalize those percentages within each GPA range, ensuring that each sleep section is equally represented across GPA categories. This approach helps us focus on how sleep habits within each GPA group are distributed, removing any bias caused by the fact that certain sleep sections (like 5am-6am) might generally have more people.
+
+##### How the Plot Was Created:
+
+1. **Step 1 - Binning GPAs and Sleep Times**: We divided the `term_gpa` into five categories: 0-2, 2-3, 3-3.3, 3.3-3.7, and 3.7-4. The `midpoint_sleep` variable was also categorized into sleep sections based on the midpoint of when the students reported sleeping (e.g., 3am-4am, 4am-5am).
+   
+2. **Step 2 - First Normalization**: For each sleep section within each GPA range, we calculated the percentage of students in that group, allowing us to understand the distribution of sleep patterns across all GPA ranges.
+
+3. **Step 3 - Second Normalization**: We further normalized the data within each GPA range to account for the varying numbers of students in each sleep section. This ensures that sections with more students overall do not dominate the plot, giving us a clearer picture of how sleep patterns relate to GPA.
+
+4. **Step 4 - Visualization**: Finally, we created a series of bar plots to visualize the percentage of students in each sleep section for each GPA range, using a consistent y-axis (percentage) across all plots. Each panel represents a different GPA range, showing the normalized distribution of students across sleep sections.
+
+
+```{r}
+library(ggplot2)
+library(dplyr)
+
+# Step 1: Create GPA sections (bins)
+df.main$gpa_sections <- cut(df.main$term_gpa, breaks = c(0, 2, 3, 3.3, 3.7, 4), labels = c("0 - 2", "2 - 3", "3 - 3.3", "3.3 - 3.7", "3.7 - 4"), right = FALSE)
+
+# Step 2: Create Sleep Sections if not already done
+df.main$midpoint_sleep_sections <- cut(df.main$midpoint_sleep, breaks = c((0:2)*120, (5:8)*60), labels = c("11pm - 1am", "1am - 3am", "3am - 4am", "4am - 5am", "5am - 6am", "6am - 7am"), right = FALSE)
+
+# Step 3: Calculate percentages of people in each GPA section and sleep section
+df_percent <- df.main %>%
+  group_by(midpoint_sleep_sections, gpa_sections) %>%
+  summarise(count = n()) %>% na.omit() %>%
+  mutate(percentage_first = count / sum(count) * 100) %>%
+  group_by(gpa_sections) %>%
+  mutate(percentage_final = percentage_first / sum(percentage_first) * 100)
+
+# Step 4: Plot barplots for each GPA section
+ggplot(df_percent, aes(x = percentage_final, y = midpoint_sleep_sections, fill = midpoint_sleep_sections)) + 
+  geom_bar(stat = "identity", color = "white") + 
+  facet_wrap(~gpa_sections, ncol = 2) +  # One plot for each GPA section
+  labs(y = "Sleep Sections", x = "Percentage", title = "Normalized Distribution of Sleep Patterns Across GPA Ranges") +
+  scale_x_continuous(labels = scales::percent_format(scale = 1)) +  # Show y-axis as percentage
+  theme_minimal() +
+  theme(legend.position = "none")  # Remove legend as it's not needed
+
+```
+
+
+The plot reveals some interesting insights into the relationship between sleep patterns and GPA:
+- **0-2 GPA**: The highest percentage of students with a GPA in the 0-2 range tend to sleep between 6am and 7am, suggesting that later sleep times may be associated with lower academic performance.
+- **2-3 GPA**: Students in this GPA range appear to be more evenly distributed across sleep sections, but those sleeping between 5am and 6am still represent a relatively higher percentage.
+- **3-3.3 GPA**: This GPA group has a more balanced distribution across sleep sections, with no single sleep time dominating, which could suggest more regular sleep habits among students with average academic performance.
+- **3.3-3.7 GPA**: In this group, students tend to sleep slightly earlier, with a notable percentage sleeping between 4am and 5am, possibly indicating a more consistent or healthier sleep schedule correlating with better academic performance.
+- **3.7-4 GPA**: The highest-performing students (GPA 3.7-4) have the largest proportion sleeping between 3am and 4am, which is earlier than the lower GPA groups. This suggests that students with higher GPAs may tend to sleep earlier overall, potentially leading to better academic outcomes.
+
+By normalizing the data twice, we were able to remove any bias caused by differing numbers of students in each sleep section, allowing for a more direct comparison of sleep habits across GPA ranges. This analysis highlights potential connections between earlier sleep times and higher academic achievement.
+
+
+## 6.3 How does the number of units and sleep time affect academic performance across universities?
+
+### 6.3.1 Sleep time and GPA Increase
+
+We calculate the change in GPA and examine its relationship with sleep time across different universities.
+
+```{r}
+# Calculate GPA increase
+df.main$increased_GPA <- df.main$term_gpa - df.main$cum_gpa
+
+# Scatter plot of sleep time vs increased GPA per university
+ggplot(df.main, aes(x = TotalSleepTime, y = increased_GPA)) + 
+  geom_point(color = "lightblue") +  
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black") + 
+  ylim(-2, 2) + 
+  labs(x = "Total Sleep Time", y = "Increased GPA", title = "Sleep Time vs Increased GPA by University") +
+  facet_wrap(~university, scales = 'free') + 
+  theme_minimal()
+```
+
+
+### 6.3.2 Sleep Time, Number of Units and Increased GPA
+
+We now examine the relationship between the number of units taken and the total sleep time, per university.
+
+```{r}
+# Scatter plot of sleep time vs number of units
+df.clean$increased_GPA <- df.clean$term_gpa - df.clean$cum_gpa
+
+ggplot(df.clean, aes(x = term_units, y = TotalSleepTime, color = increased_GPA)) + 
+  geom_point(alpha=0.7) + 
+  labs(x = "Number of Units", y = "Total Sleep Time", title = "Sleep Time vs Number of Units by University") +
+  facet_wrap(~university, scales = 'free') + 
+  scale_color_gradient(low = "red", high = "green") +  # Color gradient from blue to red
+  theme_minimal()
+```
+
+
+
+We can see that there is not much of a relationship with this variables. Just some outliers at the bottom of the `TotalSleepTime` with usually a negative increased GPA, meaning that (at least in this sample) people who sleep the least usually decrease their GPA score.
+
+
+## 6.4 Impact of Prior Academic Performance on New Grades in a University Transition
+
+We will examine the differences between the `cumulative GPA` and the new `term_gpa`, comparing these across universities, as each institution presents varying levels of academic difficulty.
+
+```{r}
+ggplot(df.clean, aes(x = cum_gpa, y = term_gpa, color = cohort)) + 
+  geom_point(alpha=0.7) + 
+  geom_abline(slope = 1, intercept = 0, color = "black", linetype = "dashed") +
+  labs(x = "Cumulative GPA", y = "Term GPA", title = "") +
+  facet_wrap(~university, scales = 'free') + 
+  #scale_color_gradient(low = "red", high = "green") +  # Color gradient from blue to red
+  theme_minimal()
+```
+
+This scatter plot shows the relationship between **Cumulative GPA** (GPA prior to the academic year) and **Term GPA** (GPA during the current term) for students from **Carnegie Mellon** and **Washington** universities. The diagonal dashed line represents **no improvement** — points above the line indicate a **positive improvement** in GPA, while points below the line show a **negative change**.
+
+ - **Above the line**: Students improved their GPA compared to their previous cumulative GPA.
+ - **On the line**: Students maintained similar GPA performance.
+ - **Below the line**: Students' GPA declined during the term.
+
+The **Washington** students are mostly clustered around or above the line, indicating consistent or slightly improved performance. In contrast, **Carnegie Mellon** students show more variability, with some making significant improvements and others showing declines. 
+
+Also an interesting observation is that students with a cumulative GPA above 3.5 in Washington University are much more consistent than CMU students in the meaning of maintaining or even improving their grades. 
+
+
+## 6.5 Correlation Analysis
+
+We calculate the correlation matrix between numerical variables and visualize it using a heatmap.
+
+```{r, fig.width=6, fig.height=5}
+suppressMessages(library(corrplot))
+
+# Select numeric columns excluding 'subject_id'
+numeric_cols <- sapply(df.main, is.numeric)
+numeric_cols <- setdiff(names(numeric_cols[numeric_cols]), "subject_id")
+
+# Calculate the correlation matrix
+cor_matrix <- cor(df.main[, numeric_cols], use = "complete.obs")
+cor_matrix %>% corrplot(., method="ellipse", type="full", tl.col="gray")
+```
+
+
+after this correlation matrix plot we can observed some linear correlation between the three `gpa` variables, which was expected. However, we can't find any important correlation between other variables. 
+
+
+## 6.6 Sleep Time by Study and Gender
+
+Finally, we compare the distribution of sleep time across different studies and between genders to check if there is a major difference between some of them.
+
+```{r}
+# Boxplot of sleep time by study and gender
+ggplot(df.main, aes(x = study, y = TotalSleepTime)) +
+  geom_boxplot(color="purple") +
+  facet_wrap(~demo_gender, scales = "free_x", labeller = as_labeller(c("0" = "Male", "1" = "Female"))) +  
+  labs(x="Study", y="Total Sleep Time", title="Sleep Time by Study and Gender")
+```
+
+Is not possible to find any gender difference on the data, both look similar obviously with some random changes as every person is different. Also between different studies we observed similar results.
+
+
+
+
+# 7. Conclusion
+
+In this analysis, we explored several aspects of the dataset, including the distribution of GPA across different studies and genders, the relationship between sleep time and GPA, and the correlations between key numerical variables. We handled missing data appropriately by creating two versions of the dataset and focused our analysis on meaningful relationships. The visualizations and correlation analysis provided deeper insights into the sleep and academic performance patterns of students. 
+
